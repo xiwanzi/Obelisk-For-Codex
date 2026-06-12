@@ -41,6 +41,26 @@ Anything Codex has done before can become structured, queryable memory: sessions
 
 Codex 做过的事情都可以变成结构化记忆：sessions、messages、tool calls、tool outputs、failures、summaries、file history、spawned agents、workflow-like runs，以及批准写入的 markdown memories。
 
+## Current Capabilities / 当前能力
+
+- Indexes Codex JSONL from `~/.codex/sessions/` and `~/.codex/archived_sessions/`.
+- Rebuilds derived tables when the indexer schema changes while preserving registered memories.
+- Exposes helper-first retrieval through `overview()`, `memories()`, `search()`, `fileEdits()`, `failures()`, `workflows()`, and related APIs.
+- Stores durable memory as project markdown, typically under `.obelisk/memories/`, with an English retrieval summary linked back to source sessions/messages.
+- Tracks message `cwd` and tool-level `workdir` so project/file queries match Codex's session layout instead of Claude Code's project directory model.
+- Reconstructs Codex spawned-agent workflow-like runs from `spawn_agent`, `wait_agent`, and `close_agent`.
+- Keeps query scripts read-only; memory registration runs in a separate `--remember` sandbox.
+
+当前能力：
+
+- 索引 `~/.codex/sessions/` 和 `~/.codex/archived_sessions/` 中的 Codex JSONL。
+- indexer schema 变化时重建派生表，同时保留已注册 memories。
+- 通过 `overview()`、`memories()`、`search()`、`fileEdits()`、`failures()`、`workflows()` 等 helper-first API 检索历史。
+- 用项目内 markdown 保存持久 memory，推荐位置是 `.obelisk/memories/`；索引英文 summary，并回指 source sessions/messages。
+- 记录 message `cwd` 和 tool-level `workdir`，按 Codex 的 session 结构查询项目和文件，不照搬 Claude Code 的项目目录模型。
+- 从 `spawn_agent`、`wait_agent`、`close_agent` 重建 Codex spawned-agent workflow-like runs。
+- 普通 query 脚本只读；memory 注册使用隔离的 `--remember` sandbox。
+
 ## Install / 安装
 
 Install as a Codex skill:
@@ -62,6 +82,21 @@ Then ask Codex:
 ```
 
 First run builds the index. Later runs update incrementally.
+
+## CLI Usage / 命令行用法
+
+Run from the repository or installed skill directory:
+
+```powershell
+node scripts/runtime.mjs --build
+node scripts/runtime.mjs --search "auth fix"
+node scripts/runtime.mjs --query .\query.mjs
+node scripts/runtime.mjs --remember .\register-memory.mjs
+```
+
+`--query` exposes read-only helpers such as `overview()`, `search()`, `sql()`, and `memories()`. `--remember` exposes only `remember()`.
+
+`--query` 暴露只读 helper，例如 `overview()`、`search()`、`sql()` 和 `memories()`。`--remember` 只暴露 `remember()`。
 
 ## Requires / 依赖
 
@@ -86,6 +121,18 @@ The agent answers with concise evidence
 When a retrieval produces a durable conclusion worth keeping, the agent can propose a markdown memory file. After user approval, it registers the file with `runtime.mjs --remember <script>`, which exposes only `remember()`.
 
 当一次检索产生值得长期保留的结论时，agent 可以提议写入 markdown memory。用户批准后，用 `runtime.mjs --remember <script>` 注册；该运行时只暴露 `remember()`。
+
+## Memory Workflow / Memory 工作流
+
+1. Query history with `overview()`, `memories()`, and raw session evidence from `search()` or focused helpers.
+2. Synthesize the durable conclusion in the user's normal language.
+3. If the conclusion should persist, write a markdown memory file inside the project, usually `.obelisk/memories/<topic>.md`.
+4. Register it with `runtime.mjs --remember <script>` using an English `summary`.
+5. Future recalls use `memories({ query: 'English topic terms' })` as prior notes, then confirm facts against raw session evidence.
+
+Memory summaries and `memories({ query })` terms are intentionally English-indexed for stable retrieval. Non-English user requests should be translated into concise English keywords before querying the memory layer.
+
+Memory summary 和 `memories({ query })` 查询词固定使用英文索引，便于稳定召回。中文请求应先翻译成简短英文关键词再查询 memory 层。
 
 ## Query API / 查询 API
 
@@ -140,11 +187,31 @@ Memory registration:
 - File extraction from arbitrary shell commands is best effort. `fileEdits()` uses high-confidence write heuristics such as `apply_patch` and common PowerShell write commands.
 - FTS5 supports standard syntax. For punctuation-heavy Windows paths, pass a valid FTS phrase yourself or use scoped SQL `LIKE`; `search()` does not silently rewrite failed queries.
 
+## Evaluation / 验证
+
+Synthetic fixtures use fake Codex homes and do not touch real session data:
+
+```powershell
+node evals/obelisk-codex/runners/run-api-eval.mjs --lane synthetic --stage upstream-memory-port
+```
+
+Local smoke uses the real `~/.codex` but stores only redacted counts and hashes:
+
+```powershell
+node evals/obelisk-codex/runners/run-api-eval.mjs --lane local --stage upstream-memory-port
+```
+
+The benchmark covers memory registration/recall, CJK memory guardrails, `overview()`, `search()` rank and `cwd` filtering, read-only SQL guardrails, file edit helpers, failures, raw recovery, spawned-agent reconstruction, and incremental indexing.
+
 ## Structure / 结构
 
 ```text
 obelisk-codex/
 ├── SKILL.md
+├── docs/
+│   └── obelisk-codex-benchmark.md
+├── evals/
+│   └── obelisk-codex/
 ├── scripts/
 │   ├── db.mjs
 │   ├── indexer.mjs
