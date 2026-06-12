@@ -14,7 +14,7 @@ import {
   path,
 } from './db.mjs';
 
-const INDEXER_VERSION = 'codex-v5-agents-file-edits';
+const INDEXER_VERSION = 'codex-v6-memory-overview-cwd';
 
 function walkJsonl(dir, files = []) {
   if (!isDir(dir)) return files;
@@ -149,9 +149,28 @@ function isErrorPayload(payload, text) {
   return 0;
 }
 
+function inputWorkdir(input, fallback = null) {
+  if (input && typeof input === 'object') return input.workdir || input.cwd || fallback;
+  return fallback;
+}
+
 function insertMessage(ins, sid, msgId, type, ts, role, text, model = null, opts = {}) {
   if (!text) return false;
-  ins.msg.run(msgId, sid, type, opts.parentUuid || null, ts, role, trunc(text), model, opts.isSidechain ? 1 : 0, opts.agentId || null, opts.inputTokens || null, opts.outputTokens || null);
+  ins.msg.run(
+    msgId,
+    sid,
+    type,
+    opts.parentUuid || null,
+    ts,
+    role,
+    trunc(text),
+    model,
+    opts.isSidechain ? 1 : 0,
+    opts.agentId || null,
+    opts.inputTokens || null,
+    opts.outputTokens || null,
+    opts.cwd || null,
+  );
   return true;
 }
 
@@ -205,7 +224,7 @@ function recordAgentConclusion(ins, sm, sid, agents, agentId, status, source, ts
   agent.failed = agent.failed || role === 'subagent_error';
   agent.conclusions.push({ source, timestamp: ts, role, text: trunc(text) });
   const msgId = `${sid}:${lineNum}:agent:${agentId}:${source}`;
-  if (insertMessage(ins, sid, msgId, 'agent_result', ts, role, text, model, { agentId })) sm.n++;
+  if (insertMessage(ins, sid, msgId, 'agent_result', ts, role, text, model, { agentId, cwd: sm.current_cwd })) sm.n++;
 }
 
 function resetIndexIfVersionChanged(db) {
@@ -225,7 +244,7 @@ function indexJsonl(db, fi, titleBySession) {
 
   const ins = {
     ses: db.prepare('INSERT OR REPLACE INTO sessions (id,title,project,project_path,started_at,ended_at,git_branch,version,message_count,jsonl_path) VALUES (?,?,?,?,?,?,?,?,?,?)'),
-    msg: db.prepare('INSERT OR REPLACE INTO messages (uuid,session_id,type,parent_uuid,timestamp,role,text,model,is_sidechain,agent_id,input_tokens,output_tokens) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)'),
+    msg: db.prepare('INSERT OR REPLACE INTO messages (uuid,session_id,type,parent_uuid,timestamp,role,text,model,is_sidechain,agent_id,input_tokens,output_tokens,cwd) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)'),
     tc:  db.prepare('INSERT OR REPLACE INTO tool_calls (id,message_uuid,session_id,name,input_json,file_path) VALUES (?,?,?,?,?,?)'),
     tr:  db.prepare('INSERT OR REPLACE INTO tool_results (tool_use_id,message_uuid,session_id,content,file_path,is_error) VALUES (?,?,?,?,?,?)'),
     sum: db.prepare('INSERT OR REPLACE INTO summaries (id,session_id,timestamp,source,content) VALUES (?,?,?,?,?)'),
@@ -245,6 +264,7 @@ function indexJsonl(db, fi, titleBySession) {
     title: existing?.title || titleBySession.get(sid) || null,
     project: existing?.project || null,
     project_path: existing?.project_path || null,
+    current_cwd: existing?.project_path || null,
     model: null,
     n: existing?.message_count || 0,
   };
@@ -272,6 +292,7 @@ function indexJsonl(db, fi, titleBySession) {
         if (!sm.title) sm.title = titleBySession.get(sid) || null;
       }
       sm.project_path = payload.cwd || sm.project_path;
+      sm.current_cwd = payload.cwd || sm.current_cwd;
       sm.project = projectLabel(payload.cwd, fi.archived ? 'archived' : 'codex');
       sm.version = payload.cli_version || sm.version;
       return;
@@ -279,6 +300,7 @@ function indexJsonl(db, fi, titleBySession) {
 
     if (obj.type === 'turn_context') {
       sm.project_path = payload.cwd || sm.project_path;
+      sm.current_cwd = payload.cwd || sm.current_cwd;
       sm.project = projectLabel(payload.cwd, sm.project || (fi.archived ? 'archived' : 'codex'));
       sm.model = payload.model || sm.model;
       if (payload.summary) {
@@ -297,7 +319,7 @@ function indexJsonl(db, fi, titleBySession) {
 
     if (obj.type === 'event_msg' && ptype === 'user_message') {
       const text = messageTextForPayload(payload);
-      if (insertMessage(ins, sid, msgId, 'user', ts, 'user', text, sm.model)) sm.n++;
+      if (insertMessage(ins, sid, msgId, 'user', ts, 'user', text, sm.model, { cwd: sm.current_cwd })) sm.n++;
       if (!sm.title && text) sm.title = text.slice(0, 80);
       return;
     }
@@ -305,7 +327,7 @@ function indexJsonl(db, fi, titleBySession) {
     if (obj.type === 'event_msg' && ptype === 'agent_message') {
       const text = messageTextForPayload(payload);
       const role = payload.phase ? `assistant:${payload.phase}` : 'assistant';
-      if (insertMessage(ins, sid, msgId, 'assistant', ts, role, text, sm.model)) sm.n++;
+      if (insertMessage(ins, sid, msgId, 'assistant', ts, role, text, sm.model, { cwd: sm.current_cwd })) sm.n++;
       return;
     }
 
@@ -325,7 +347,7 @@ function indexJsonl(db, fi, titleBySession) {
 
     if (ptype === 'reasoning') {
       const text = messageTextForPayload(payload);
-      if (insertMessage(ins, sid, msgId, 'reasoning', ts, 'assistant_reasoning', text, sm.model)) sm.n++;
+      if (insertMessage(ins, sid, msgId, 'reasoning', ts, 'assistant_reasoning', text, sm.model, { cwd: sm.current_cwd })) sm.n++;
       return;
     }
 
@@ -340,13 +362,14 @@ function indexJsonl(db, fi, titleBySession) {
       const id = payload.call_id || `${msgId}:call`;
       const name = toolName(payload);
       const input = toolInput(payload);
+      const cwd = inputWorkdir(input, sm.current_cwd || sm.project_path);
       const inputJson = truncJson(input ?? payload);
-      const fp = filePath(name, input, { workdir: sm.project_path });
+      const fp = filePath(name, input, { workdir: cwd });
       const text = `${name}\n${inputJson || ''}`.trim();
-      insertMessage(ins, sid, msgId, 'tool_call', ts, 'tool_call', text, sm.model);
+      insertMessage(ins, sid, msgId, 'tool_call', ts, 'tool_call', text, sm.model, { cwd });
       sm.n++;
       ins.tc.run(id, msgId, sid, name, inputJson, fp);
-      callInfo.set(id, { id, name, input, msgId, timestamp: ts, lineNum });
+      callInfo.set(id, { id, name, input, msgId, timestamp: ts, lineNum, cwd });
       if (fp) callFiles.set(id, fp);
       lastToolCallId = id;
       return;
@@ -355,11 +378,12 @@ function indexJsonl(db, fi, titleBySession) {
     if (['function_call_output', 'custom_tool_call_output', 'tool_search_output', 'web_search_end', 'patch_apply_end', 'mcp_tool_call_end'].includes(ptype)) {
       const id = payload.call_id || lastToolCallId || `${msgId}:result`;
       const text = outputText(payload);
-      insertMessage(ins, sid, msgId, 'tool_result', ts, 'tool_result', text, sm.model);
-      sm.n++;
-      const fp = callFiles.get(id) || filePath(toolName(payload), payload, { workdir: sm.project_path });
-      ins.tr.run(id, msgId, sid, text, fp, isErrorPayload(payload, text));
       const call = callInfo.get(id);
+      const cwd = inputWorkdir(toolInput(payload), call?.cwd || sm.current_cwd || sm.project_path);
+      insertMessage(ins, sid, msgId, 'tool_result', ts, 'tool_result', text, sm.model, { cwd });
+      sm.n++;
+      const fp = callFiles.get(id) || filePath(toolName(payload), payload, { workdir: cwd });
+      ins.tr.run(id, msgId, sid, text, fp, isErrorPayload(payload, text));
       const rawOutput = parseMaybeJson(payload.output);
 
       if (call?.name === 'spawn_agent') {

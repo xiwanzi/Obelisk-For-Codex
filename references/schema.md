@@ -8,113 +8,69 @@ Data sources:
 - `~/.codex/archived_sessions/*.jsonl`
 - `~/.codex/session_index.jsonl` for thread titles
 
-The database keeps the original Obelisk table names so existing query snippets stay familiar, but the indexed records come from Codex JSONL events.
+The database keeps Obelisk-style table names, but rows are derived from Codex JSONL events.
 
-## sessions
+## 1. Database Schema
+
+### sessions
 
 One row per Codex JSONL session.
 
 ```sql
 CREATE TABLE sessions (
-  id            TEXT PRIMARY KEY,  -- Codex session id
-  title         TEXT,              -- session_index thread_name or first user message
-  project       TEXT,              -- usually cwd, normalized to forward slashes
-  project_path  TEXT,              -- original cwd when available
+  id            TEXT PRIMARY KEY,
+  title         TEXT,
+  project       TEXT,              -- cwd normalized to forward slashes, or fallback label
+  project_path  TEXT,              -- normalized session cwd when available
   started_at    TEXT,
   ended_at      TEXT,
-  git_branch    TEXT,              -- currently usually NULL for Codex logs
-  version       TEXT,              -- Codex CLI/app version when available
+  git_branch    TEXT,
+  version       TEXT,
   message_count INTEGER DEFAULT 0,
   jsonl_path    TEXT
 );
 ```
 
-Common queries:
+### messages
 
-```js
-sessions({ limit: 10 })
-sessions({ project: '%wiki维护%' })
-sessions({ after: '2026-06-01', limit: 20 })
-```
-
-## messages
-
-Indexed Codex records. UUIDs are synthetic: `<sessionId>:<lineNumber>`.
+Indexed Codex records. UUIDs are synthetic for Codex event lines: `<sessionId>:<lineNumber>`.
 
 ```sql
 CREATE TABLE messages (
   uuid          TEXT PRIMARY KEY,
   session_id    TEXT,
-  type          TEXT,              -- user, assistant, reasoning, tool_call, tool_result
-  parent_uuid   TEXT,              -- usually NULL in Codex logs
+  type          TEXT,              -- user, assistant, reasoning, tool_call, tool_result, agent_result
+  parent_uuid   TEXT,
   timestamp     TEXT,
-  role          TEXT,              -- user, assistant, assistant:final, tool_call, tool_result
+  role          TEXT,
   text          TEXT,
   model         TEXT,
   is_sidechain  INTEGER DEFAULT 0,
   agent_id      TEXT,
   input_tokens  INTEGER,
-  output_tokens INTEGER
+  output_tokens INTEGER,
+  cwd           TEXT               -- cwd at message/tool-call time when known
 );
 ```
 
-Codex mapping:
+Search uses `messages_fts`.
 
-- `event_msg:user_message` -> `type='user'`, `role='user'`
-- `event_msg:agent_message` -> `type='assistant'`, `role='assistant'` or `assistant:<phase>`
-- `response_item:reasoning` -> `type='reasoning'`, `role='assistant_reasoning'`
-- `response_item:function_call` / `custom_tool_call` / `tool_search_call` -> `type='tool_call'`
-- `response_item:function_call_output` / `custom_tool_call_output` / `tool_search_output` -> `type='tool_result'`
-
-Search uses `messages_fts`:
-
-```js
-search('TACZ wiki')
-search('"Exit code" AND sync_public_wiki', { limit: 20 })
-```
-
-## tool_calls
-
-One row per indexed Codex tool call when possible.
+### tool_calls
 
 ```sql
 CREATE TABLE tool_calls (
-  id           TEXT PRIMARY KEY,   -- Codex call_id
+  id           TEXT PRIMARY KEY,
   message_uuid TEXT,
   session_id   TEXT,
-  name         TEXT,               -- shell_command, apply_patch, tool_search_call, js, view_image...
+  name         TEXT,
   input_json   TEXT,
-  file_path    TEXT                -- best-effort extraction
+  file_path    TEXT
 );
 ```
 
-`file_path` is reliable when the tool input explicitly contains `file_path` or `path`. For PowerShell commands and `apply_patch`, Obelisk-Codex extracts candidates, normalizes paths, and filters common runtime/tool paths such as Python, Node, adb, cache directories, wildcard image paths, and real directories.
+`file_path` is best effort. For Codex shell and patch tools, Obelisk-Codex prioritizes explicit path fields, patch headers, and tool `workdir` before falling back to session cwd.
 
-Examples:
-
-```js
-sql(`
-  SELECT name, COUNT(*) n
-  FROM tool_calls
-  GROUP BY name
-  ORDER BY n DESC
-  LIMIT 20
-`)
-```
-
-```js
-fileHistory('C:\\Mod\\wiki维护\\sync_public_wiki.py', { limit: 20 })
-fileSessions('C:\\Mod\\wiki维护\\sync_public_wiki.py', { limit: 20 })
-repeatedFiles({ minSessions: 3, limit: 20 })
-```
-
-`fileSessions()` groups by session and includes `tool_calls` for the matching file path so the answer can cite which command or patch touched the file.
-Use `{ mode: 'write' }` or `fileEdits()` when the user asks where a file was modified rather than merely read or searched. The write-mode heuristic treats `apply_patch`, common file-writing tools, and common PowerShell write/move/delete commands as high-confidence edits.
-For `apply_patch`, file extraction uses patch headers first so paths mentioned inside documentation examples do not get indexed as edited files.
-
-## tool_results
-
-Tool outputs linked by `call_id`.
+### tool_results
 
 ```sql
 CREATE TABLE tool_results (
@@ -127,76 +83,45 @@ CREATE TABLE tool_results (
 );
 ```
 
-`is_error` is inferred from explicit failed statuses, error fields, or output containing `Exit code: <non-zero>`.
+`is_error` comes from explicit failed status/error fields or non-zero shell exit output.
 
-```js
-failures({ limit: 20 })
-```
-
-## summaries
-
-Compaction and task-completion summaries.
+### summaries
 
 ```sql
 CREATE TABLE summaries (
   id TEXT PRIMARY KEY,
   session_id TEXT,
   timestamp TEXT,
-  source TEXT,       -- context_compacted, task_complete, turn_context
+  source TEXT,       -- context_compacted, task_complete, turn_context, agent_spawn_failed
   content TEXT
 );
 ```
 
-```js
-summaries({ limit: 20 })
-summaries({ sessionId: '019e...' })
-```
+### subagents, workflows, workflow_agents
 
-## Codex Multi-Agent Tables
-
-These tables are retained from upstream Obelisk and populated from Codex multi-agent tool calls:
-
-- `spawn_agent` creates agent metadata
-- `wait_agent` records agent conclusions
-- `close_agent` records final previous status when available
-- a Codex session with spawned agents becomes one workflow-like run: `run_id = "codex:<sessionId>"`
-
-### subagents
+Codex spawned-agent calls are reconstructed from `spawn_agent`, `wait_agent`, and `close_agent`.
 
 ```sql
 CREATE TABLE subagents (
   agent_id TEXT PRIMARY KEY,
   session_id TEXT,
-  parent_tool_use_id TEXT, -- spawn_agent call_id
+  parent_tool_use_id TEXT,
   agent_type TEXT,
-  description TEXT,       -- nickname + first line of spawn task
+  description TEXT,
   duration_ms INTEGER,
   total_tokens INTEGER
 );
-```
 
-`subagents()` adds:
-
-- `messageCount`
-- `latestConclusion`
-
-### workflows
-
-```sql
 CREATE TABLE workflows (
-  run_id TEXT PRIMARY KEY,
+  run_id TEXT PRIMARY KEY,         -- codex:<sessionId>
   session_id TEXT,
   task_id TEXT,
-  script TEXT,            -- session title
-  result_json TEXT,       -- source, completed_agents, failed_agents
+  script TEXT,
+  result_json TEXT,
   timestamp TEXT,
   agent_count INTEGER DEFAULT 0
 );
-```
 
-### workflow_agents
-
-```sql
 CREATE TABLE workflow_agents (
   agent_id TEXT PRIMARY KEY,
   run_id TEXT,
@@ -206,85 +131,186 @@ CREATE TABLE workflow_agents (
 );
 ```
 
-`workflowTree(runId)` returns `{ workflow, result, agents }`. Each agent includes:
+### memories
 
-- `subagent`
-- `messages`
-- `conclusions`
+Registered markdown memories. The markdown file at `path` is the durable content; `summary` is the compact English retrieval text.
 
-## API Notes
-
-- `context(uuid)` returns `message`, `session`, `parentChain`, and `neighbors`. `neighbors` is the useful context source for Codex because parent UUID chains are usually unavailable.
-- `trace(uuid)` usually returns only the selected message unless parent links are present.
-- `raw(uuid, opts?)` parses the synthetic UUID line number and returns a window of the original JSONL line.
-- `thread(sessionId)` can be large; use it only after narrowing to the session you need.
-
-## Useful Query Patterns
-
-Recent sessions:
-
-```js
-return recent(10).map(s => ({
-  id: s.id,
-  title: s.title,
-  project: s.project,
-  ended: s.ended_at
-}))
+```sql
+CREATE TABLE memories (
+  id TEXT PRIMARY KEY,
+  session_id TEXT,
+  project TEXT,
+  message_start TEXT,
+  message_end TEXT,
+  path TEXT,
+  summary TEXT,
+  created_at TEXT
+);
 ```
 
-Find where a command was run:
+Indexes exist for `project`, `session_id`, and `created_at`.
 
-```js
-return sql(`
-  SELECT tc.name, tc.input_json, s.title, m.timestamp
-  FROM tool_calls tc
-  JOIN messages m ON m.uuid = tc.message_uuid
-  JOIN sessions s ON s.id = tc.session_id
-  WHERE tc.name = 'shell_command'
-    AND tc.input_json LIKE ?
-  ORDER BY m.timestamp DESC
-  LIMIT 20
-`, '%sync_public_wiki%')
+### Key Relationships
+
+```text
+sessions.id        <-- messages.session_id
+sessions.id        <-- tool_calls.session_id
+sessions.id        <-- tool_results.session_id
+sessions.id        <-- summaries.session_id
+sessions.id        <-- subagents.session_id
+sessions.id        <-- workflows.session_id
+sessions.id        <-- memories.session_id
+messages.uuid      <-- tool_calls.message_uuid
+messages.uuid      <-- tool_results.message_uuid
+messages.uuid      <-- memories.message_start / memories.message_end
+workflows.run_id   <-- workflow_agents.run_id
 ```
 
-Find failed commands:
+## 2. Query API Reference
+
+### `search(text, opts?)`
+
+Full-text search across indexed messages and tool records.
+
+Opts: `{ limit, sessionId, project, after, before, cwd }`
+
+- `project` is SQL `LIKE` over `sessions.project`.
+- `cwd` is SQL `LIKE` over `messages.cwd`.
+- Returns `rank` from FTS5; lower rank sorts earlier.
+- `search()` passes raw FTS syntax through. For punctuation-heavy strings, pass a valid FTS phrase yourself or use scoped SQL `LIKE`.
+
+### `context(uuid)`
+
+Returns `{ message, parentChain, neighbors, session, subagent, workflow }`.
+
+Codex parent chains are usually unavailable. Use `neighbors` for local context.
+
+### `sql(query, ...params)`
+
+Read-only SQL escape hatch. Only `SELECT` and `WITH` are allowed; mutating/admin SQL is rejected.
+
+Common joins:
+
+```sql
+tool_calls tc
+JOIN messages m ON m.uuid = tc.message_uuid
+JOIN sessions s ON s.id = tc.session_id
+```
+
+### `overview(opts?)`
+
+Compact orientation map. `opts` may be a project string, number limit, or object.
+
+```js
+const map = overview({ project: '%Obelisk%', limit: 5, memoryLimit: 5 });
+return {
+  current: map.current,
+  current_project: map.current_project,
+  totals: map.totals,
+};
+```
+
+Returns:
+
+```js
+{
+  current: { cwd, project },
+  current_project: {
+    project, project_path, session_total, memory_total,
+    sessions: [{ id, title, project, project_path, started_at, ended_at, git_branch, message_count }],
+    memories: [{ id, path, summary, session_id, project, created_at }]
+  },
+  projects: [{ project, project_path, session_count, memory_count, last_session_at, last_memory_at, recent_branches }],
+  totals: { projects, sessions, memories }
+}
+```
+
+`overview()` is a map, not proof. Confirm facts with `memories()`, `search()`, helpers, or SQL.
+
+### `memories(opts?)`
+
+Recall memory layer records, newest first.
+
+Opts: `{ query, project, sessionId, sessions, after, before, branch, limit }`
+
+- `query` filters `summary` and `path` using English terms.
+- Hyphens and underscores are treated as spaces.
+- CJK text in `query` is rejected to keep memory retrieval language-stable.
+
+```js
+return memories({
+  project: '%Obelisk%',
+  query: 'persistent Codex memory layer',
+  limit: 5,
+});
+```
+
+### `remember(record)`
+
+Available only through `runtime.mjs --remember <script>`.
+
+```js
+return remember({
+  path: '.obelisk/memories/design-decision.md',
+  session_id: 'source-session-id',
+  message_start: 'first-message-uuid',
+  message_end: 'last-message-uuid',
+  summary: 'Decision: keep durable conclusions in markdown memories and index English summaries.'
+});
+```
+
+Fields:
+
+- `path`: existing markdown file. Relative paths resolve against the source session `project_path` when `session_id` is provided.
+- `session_id`: source Codex session.
+- `message_start`, `message_end`: optional source evidence range.
+- `summary`: required English retrieval summary.
+- `project`: optional override; defaults from source session.
+
+`--remember` exposes only `remember()`.
+
+## 3. Other Helpers
+
+- `sessions(opts?)` / `recent(n?)`
+- `summaries(opts?)`
+- `fileHistory(filePath, opts?)`
+- `fileSessions(filePath, opts?)`
+- `fileEdits(filePath, opts?)`
+- `repeatedFiles(opts?)`
+- `failures(opts?)`
+- `subagents(opts?)`
+- `workflows(opts?)`
+- `workflowTree(runId)`
+- `thread(sessionId)`
+- `raw(uuid, opts?)`
+
+## 4. Useful Patterns
+
+Find recent failures:
 
 ```js
 return failures({ limit: 20 }).map(f => ({
   tool: f.toolCall?.name,
   session: f.session?.title,
   timestamp: f.result?.timestamp,
-  output: f.result?.content?.slice(0, 500)
-}))
+  output: f.result?.content?.slice(0, 300),
+}));
 ```
 
-Find repeated files:
+Find repeated edits:
 
 ```js
 return repeatedFiles({ minSessions: 3, limit: 20 }).map(f => ({
   file: f.file_path,
   sessions: f.sessions,
   touches: f.touches,
-  last: f.last_touched
-}))
+  last: f.last_touched,
+}));
 ```
 
-`repeatedFiles()` defaults to edit mode. Pass `{ mode: 'touch' }` to include read/search mentions.
-
-Find sessions for a specific file:
+Recover raw JSONL beyond indexed truncation:
 
 ```js
-return fileSessions('C:\\Mod\\wiki维护\\sync_public_wiki.py', { limit: 20 })
-```
-
-Inspect a Codex multi-agent workflow:
-
-```js
-const run = workflows({ limit: 1 })[0]
-const tree = workflowTree(run.run_id)
-return tree.agents.map(a => ({
-  agent: a.agent_id,
-  task: a.description,
-  conclusions: a.conclusions.map(c => c.text)
-}))
+const hit = search('RAW_SENTINEL_BEGIN', { limit: 1 })[0];
+return hit ? raw(hit.message.uuid, { offset: 10000, limit: 5000 }) : null;
 ```

@@ -1,0 +1,9 @@
+{
+  "expected_facts": [
+    "没有真实失败",
+    "Exit code: 0"
+  ],
+  "expected_evidence": [
+    { "type": "tool_result", "id": "failure-false-positive-session:4", "required": true }
+  ]
+}

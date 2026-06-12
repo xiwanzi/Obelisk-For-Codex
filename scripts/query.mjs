@@ -23,6 +23,30 @@ function buildWhere(opts, aliases) {
 }
 
 const BASH_EXIT_PAT = 'Exit code [1-9]%';
+const CJK_TEXT_RE = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
+
+function assertReadOnlySql(sql) {
+  const text = String(sql || '').trim();
+  if (!/^(SELECT|WITH)\b/i.test(text)) {
+    throw new Error('sql() only supports read-only SELECT/WITH queries');
+  }
+  if (/\b(INSERT|UPDATE|DELETE|REPLACE|CREATE|DROP|ALTER|PRAGMA|VACUUM|ATTACH|DETACH)\b/i.test(text)) {
+    throw new Error('sql() only supports read-only SELECT/WITH queries');
+  }
+}
+
+function assertEnglishMemoryText(value, label) {
+  const text = String(value || '');
+  if (!text.trim()) return;
+  if (CJK_TEXT_RE.test(text)) {
+    const requirement = label.includes('query') ? 'must use English terms' : 'must be written in English';
+    throw new Error(`${label} ${requirement}; translate user-language terms before using the memory layer`);
+  }
+}
+
+function normalizeComparePath(value) {
+  return String(value || '').replace(/\\/g, '/').replace(/\/+$/g, '');
+}
 
 function pathVariants(fp) {
   const values = new Set();
@@ -53,29 +77,36 @@ function mutationSql(alias = 'tc') {
 }
 
 function createQueryApi(db) {
-  const q = (sql, ...p) => db.prepare(sql).all(...p);
+  const q = (sql, ...p) => {
+    assertReadOnlySql(sql);
+    return db.prepare(sql).all(...p);
+  };
 
   const search = (text, opts = {}) => {
-    const { limit = 20, sessionId, project, after, before } = opts;
+    const { limit = 20, sessionId, project, after, before, cwd } = opts;
     let where = 'WHERE mf.text MATCH ?';
     const p = [text];
     if (sessionId) { where += ' AND mf.session_id=?'; p.push(sessionId); }
-    if (project)   { where += ' AND s.project=?';     p.push(project); }
+    if (project)   { where += ' AND s.project LIKE ?'; p.push(project); }
     if (after)     { where += ' AND m.timestamp>?';    p.push(after); }
     if (before)    { where += ' AND m.timestamp<?';    p.push(before); }
+    if (cwd)       { where += ' AND m.cwd LIKE ?';     p.push(cwd); }
     p.push(limit);
-    const rows = db.prepare(`
-      SELECT m.uuid,m.session_id,m.text,m.role,m.timestamp,m.model,
-             s.id as s_id,s.title as s_title,s.project as s_project,s.started_at as s_started
+    const stmt = db.prepare(`
+      SELECT m.uuid,m.session_id,m.text,m.role,m.timestamp,m.model,m.cwd,
+             s.id as s_id,s.title as s_title,s.project as s_project,s.started_at as s_started,
+             rank
       FROM messages_fts mf JOIN messages m ON m.uuid=mf.uuid LEFT JOIN sessions s ON s.id=m.session_id
-      ${where} ORDER BY rank LIMIT ?`).all(...p);
+      ${where} ORDER BY rank LIMIT ?`);
+    const rows = stmt.all(...p);
     return rows.map(r => {
       const ctx = db.prepare(
         'SELECT uuid,text,role,timestamp,model FROM messages WHERE session_id=? AND uuid!=? ORDER BY ABS(JULIANDAY(timestamp)-JULIANDAY(?)) LIMIT 6'
       ).all(r.session_id, r.uuid, r.timestamp).sort((a,b) => a.timestamp < b.timestamp ? -1 : 1);
       return {
-        message: { uuid: r.uuid, text: r.text, role: r.role, timestamp: r.timestamp, model: r.model },
+        message: { uuid: r.uuid, text: r.text, role: r.role, timestamp: r.timestamp, model: r.model, cwd: r.cwd },
         session: { id: r.s_id, title: r.s_title, project: r.s_project, started_at: r.s_started },
+        rank: r.rank,
         context: ctx,
       };
     });
@@ -266,6 +297,208 @@ function createQueryApi(db) {
     return db.prepare(`SELECT su.*, s.title as session_title, s.project FROM summaries su LEFT JOIN sessions s ON s.id=su.session_id WHERE ${where} ORDER BY su.timestamp DESC LIMIT ?`).all(...params);
   };
 
+  const normalizeOverviewOpts = (optsOrScalar) => {
+    if (optsOrScalar == null) return {};
+    if (typeof optsOrScalar === 'string') return { project: optsOrScalar };
+    if (typeof optsOrScalar === 'number') return { limit: optsOrScalar };
+    return optsOrScalar;
+  };
+
+  const memories = (optsOrSid) => {
+    const opts = normalizeOpts(optsOrSid);
+    const { limit = 50, query } = opts;
+    assertEnglishMemoryText(query, 'memories() query');
+    const needsJoin = opts.branch;
+    const { where: baseWhere, params } = buildWhere(opts, {
+      sessionId: 'mem.session_id',
+      project: 'mem.project',
+      timestamp: 'mem.created_at',
+      branch: 's.git_branch',
+    });
+    const terms = String(query || '')
+      .trim()
+      .replace(/[-_]/g, ' ')
+      .split(/\s+/)
+      .filter(Boolean);
+    let where = baseWhere;
+    for (const term of terms) {
+      where += " AND lower(coalesce(mem.summary,'') || ' ' || coalesce(mem.path,'')) LIKE ?";
+      params.push(`%${term.toLowerCase()}%`);
+    }
+    params.push(limit);
+    const join = needsJoin ? 'LEFT JOIN sessions s ON s.id=mem.session_id' : '';
+    return db.prepare(`SELECT mem.* FROM memories mem ${join} WHERE ${where} ORDER BY mem.created_at DESC LIMIT ?`).all(...params);
+  };
+
+  const overview = (optsOrScalar) => {
+    const opts = normalizeOverviewOpts(optsOrScalar);
+    const cwd = process.cwd();
+    const cwdNorm = normalizeComparePath(cwd);
+    const sessionLimit = opts.limit ?? 8;
+    const projectLimit = opts.projectLimit ?? 20;
+    const memoryLimit = opts.memoryLimit ?? 100;
+
+    const projectDescriptor = (row, source, confidence) => row ? ({
+      project: row.project,
+      project_path: row.project_path || null,
+      source,
+      confidence,
+    }) : null;
+
+    const latestProjectByPattern = (pattern) => {
+      const fromSessions = db.prepare(`
+        SELECT project, project_path
+        FROM sessions
+        WHERE project LIKE ?
+        ORDER BY COALESCE(ended_at, started_at) DESC
+        LIMIT 1
+      `).get(pattern);
+      if (fromSessions) return fromSessions;
+      return db.prepare(`
+        SELECT project, NULL AS project_path
+        FROM memories
+        WHERE project LIKE ?
+        ORDER BY created_at DESC
+        LIMIT 1
+      `).get(pattern);
+    };
+
+    const resolveCurrentProject = () => {
+      if (opts.project) {
+        const row = latestProjectByPattern(opts.project);
+        const confidence = row ? (/[%_]/.test(opts.project) ? 'inferred' : 'exact') : 'unknown';
+        return projectDescriptor(row || { project: opts.project, project_path: null }, 'opts', confidence);
+      }
+
+      const paths = db.prepare(`
+        SELECT project, project_path, MAX(COALESCE(ended_at, started_at)) AS last_seen
+        FROM sessions
+        WHERE project IS NOT NULL AND project_path IS NOT NULL AND project_path != ''
+        GROUP BY project, project_path
+      `).all();
+      const byProjectPath = paths
+        .map((row) => ({ row, norm: normalizeComparePath(row.project_path) }))
+        .filter(({ norm }) => norm && (cwdNorm === norm || cwdNorm.startsWith(norm + '/')))
+        .sort((a, b) => b.norm.length - a.norm.length || String(b.row.last_seen || '').localeCompare(String(a.row.last_seen || '')))[0]?.row;
+      if (byProjectPath) return projectDescriptor(byProjectPath, 'cwd_project_path', 'exact');
+
+      const byMessageCwd = db.prepare(`
+        SELECT s.project, s.project_path, MAX(m.timestamp) AS last_seen
+        FROM messages m
+        LEFT JOIN sessions s ON s.id=m.session_id
+        WHERE m.cwd = ? AND s.project IS NOT NULL
+        GROUP BY s.project, s.project_path
+        ORDER BY last_seen DESC
+        LIMIT 1
+      `).get(cwd);
+      if (byMessageCwd) return projectDescriptor(byMessageCwd, 'cwd_messages', 'inferred');
+
+      return null;
+    };
+
+    const projects = db.prepare(`
+      WITH names AS (
+        SELECT project FROM sessions WHERE project IS NOT NULL GROUP BY project
+        UNION
+        SELECT project FROM memories WHERE project IS NOT NULL GROUP BY project
+      ),
+      session_stats AS (
+        SELECT project, COUNT(*) AS session_count, MAX(COALESCE(ended_at, started_at)) AS last_session_at
+        FROM sessions
+        WHERE project IS NOT NULL
+        GROUP BY project
+      ),
+      memory_stats AS (
+        SELECT project, COUNT(*) AS memory_count, MAX(created_at) AS last_memory_at
+        FROM memories
+        WHERE project IS NOT NULL
+        GROUP BY project
+      )
+      SELECT
+        n.project,
+        (
+          SELECT s2.project_path
+          FROM sessions s2
+          WHERE s2.project = n.project AND s2.project_path IS NOT NULL
+          ORDER BY COALESCE(s2.ended_at, s2.started_at) DESC
+          LIMIT 1
+        ) AS project_path,
+        COALESCE(ss.session_count, 0) AS session_count,
+        COALESCE(ms.memory_count, 0) AS memory_count,
+        ss.last_session_at,
+        ms.last_memory_at
+      FROM names n
+      LEFT JOIN session_stats ss ON ss.project = n.project
+      LEFT JOIN memory_stats ms ON ms.project = n.project
+      ORDER BY COALESCE(ss.last_session_at, ms.last_memory_at) DESC
+      LIMIT ?
+    `).all(projectLimit).map((row) => {
+      const branches = db.prepare(`
+        SELECT git_branch
+        FROM sessions
+        WHERE project = ? AND git_branch IS NOT NULL AND git_branch != ''
+        GROUP BY git_branch
+        ORDER BY MAX(COALESCE(ended_at, started_at)) DESC
+        LIMIT 5
+      `).all(row.project).map((r) => r.git_branch);
+      return { ...row, recent_branches: branches };
+    });
+
+    const currentProject = resolveCurrentProject();
+    let current_project = null;
+    if (currentProject?.project) {
+      const sessionTotal = db.prepare('SELECT COUNT(*) AS c FROM sessions WHERE project = ?').get(currentProject.project)?.c || 0;
+      const sessionsForProject = db.prepare(`
+        SELECT id, title, project, project_path, started_at, ended_at, git_branch, message_count
+        FROM sessions
+        WHERE project = ?
+        ORDER BY COALESCE(ended_at, started_at) DESC
+        LIMIT ?
+      `).all(currentProject.project, sessionLimit);
+      const memoryTotal = db.prepare('SELECT COUNT(*) AS c FROM memories WHERE project = ?').get(currentProject.project)?.c || 0;
+      const memoriesForProject = db.prepare(`
+        SELECT id, path, summary, session_id, project, created_at
+        FROM memories
+        WHERE project = ?
+        ORDER BY created_at DESC
+        LIMIT ?
+      `).all(currentProject.project, memoryLimit);
+      current_project = {
+        project: currentProject.project,
+        project_path: currentProject.project_path,
+        session_total: sessionTotal,
+        sessions: sessionsForProject,
+        memory_total: memoryTotal,
+        memories: memoriesForProject,
+      };
+    }
+
+    const totalProjects = db.prepare(`
+      SELECT COUNT(*) AS c
+      FROM (
+        SELECT project FROM sessions WHERE project IS NOT NULL GROUP BY project
+        UNION
+        SELECT project FROM memories WHERE project IS NOT NULL GROUP BY project
+      )
+    `).get()?.c || 0;
+    const totalSessions = db.prepare('SELECT COUNT(*) AS c FROM sessions').get()?.c || 0;
+    const totalMemories = db.prepare('SELECT COUNT(*) AS c FROM memories').get()?.c || 0;
+
+    return {
+      current: {
+        cwd,
+        project: currentProject,
+      },
+      current_project,
+      projects,
+      totals: {
+        projects: totalProjects,
+        sessions: totalSessions,
+        memories: totalMemories,
+      },
+    };
+  };
+
   const resolveJsonlPath = (messageUuid) => {
     const msg = db.prepare('SELECT session_id, agent_id FROM messages WHERE uuid=?').get(messageUuid);
     if (!msg) return null;
@@ -315,7 +548,49 @@ function createQueryApi(db) {
     };
   };
 
-  return { sql: q, search, context, trace, thread, subagents, workflows, workflowTree, fileHistory, fileSessions, fileEdits, repeatedFiles, failures, sessions, recent, summaries, raw };
+  return { sql: q, search, context, trace, thread, subagents, workflows, workflowTree, fileHistory, fileSessions, fileEdits, repeatedFiles, failures, sessions, recent, summaries, raw, memories, overview };
 }
 
-export { createQueryApi };
+function createRememberApi(db) {
+  const resolveMemoryPath = (memoryPath, sessionId) => {
+    let base = null;
+    if (sessionId) {
+      base = db.prepare('SELECT project_path FROM sessions WHERE id=?').get(sessionId)?.project_path || null;
+    }
+    const resolved = path.isAbsolute(memoryPath)
+      ? path.normalize(memoryPath)
+      : path.resolve(base || process.cwd(), memoryPath);
+    let stat;
+    try {
+      stat = fs.statSync(resolved);
+    } catch {
+      throw new Error(`remember() memory file does not exist: ${resolved}`);
+    }
+    if (!stat.isFile()) throw new Error(`remember() memory path is not a file: ${resolved}`);
+    return resolved;
+  };
+
+  const remember = ({ path: memoryPath, session_id, message_start, message_end, summary, project }) => {
+    if (!memoryPath || !summary) throw new Error('remember() requires path and summary');
+    assertEnglishMemoryText(summary, 'remember() summary');
+    const normalizedPath = resolveMemoryPath(memoryPath, session_id);
+    const id = `mem-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const proj = project || db.prepare('SELECT project FROM sessions WHERE id=?').get(session_id)?.project || null;
+    const created_at = new Date().toISOString();
+    db.prepare('INSERT OR REPLACE INTO memories (id, session_id, project, message_start, message_end, path, summary, created_at) VALUES (?,?,?,?,?,?,?,?)').run(
+      id,
+      session_id || null,
+      proj,
+      message_start || null,
+      message_end || null,
+      normalizedPath,
+      summary,
+      created_at,
+    );
+    return { id, path: normalizedPath, project: proj, created_at };
+  };
+
+  return { remember };
+}
+
+export { createQueryApi, createRememberApi };

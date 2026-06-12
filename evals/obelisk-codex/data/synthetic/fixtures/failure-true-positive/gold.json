@@ -1,0 +1,9 @@
+{
+  "expected_facts": [
+    "call_failure_true",
+    "Exit code: 1"
+  ],
+  "expected_evidence": [
+    { "type": "tool_result", "id": "call_failure_true", "required": true }
+  ]
+}

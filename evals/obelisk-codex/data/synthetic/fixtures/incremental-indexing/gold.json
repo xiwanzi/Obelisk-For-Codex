@@ -1,0 +1,10 @@
+{
+  "expected_facts": [
+    "first_count=2",
+    "second_count=3",
+    "duplicates=0"
+  ],
+  "expected_evidence": [
+    { "type": "session", "id": "incremental-indexing-session", "required": true }
+  ]
+}

@@ -1,0 +1,9 @@
+{
+  "expected_facts": [
+    "C:\\Fixture\\Obelisk\\src\\shared.ts",
+    "sessions=2"
+  ],
+  "expected_evidence": [
+    { "type": "file", "id": "C:\\Fixture\\Obelisk\\src\\shared.ts", "required": true }
+  ]
+}

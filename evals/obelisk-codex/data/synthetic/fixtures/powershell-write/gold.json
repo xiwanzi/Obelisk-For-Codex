@@ -1,0 +1,8 @@
+{
+  "expected_facts": [
+    "C:\\Fixture\\Obelisk\\notes\\plan.md"
+  ],
+  "expected_evidence": [
+    { "type": "tool_call", "id": "call_powershell_write", "required": true }
+  ]
+}

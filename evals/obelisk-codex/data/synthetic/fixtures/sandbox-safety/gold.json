@@ -1,0 +1,9 @@
+{
+  "expected_facts": [
+    "process unavailable",
+    "require unavailable",
+    "fs unavailable",
+    "loop blocked"
+  ],
+  "expected_evidence": []
+}

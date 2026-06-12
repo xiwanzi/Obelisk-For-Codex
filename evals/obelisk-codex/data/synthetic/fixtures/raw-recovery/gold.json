@@ -1,0 +1,9 @@
+{
+  "expected_facts": [
+    "RAW_SENTINEL_TAIL",
+    "raw hasMore 或 totalLength 证明原文超过索引文本"
+  ],
+  "expected_evidence": [
+    { "type": "raw", "id": "raw-recovery-session:4", "required": true }
+  ]
+}

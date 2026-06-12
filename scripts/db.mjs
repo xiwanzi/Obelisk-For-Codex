@@ -21,7 +21,7 @@ CREATE TABLE IF NOT EXISTS messages (
   uuid TEXT PRIMARY KEY, session_id TEXT, type TEXT, parent_uuid TEXT,
   timestamp TEXT, role TEXT, text TEXT, model TEXT,
   is_sidechain INTEGER DEFAULT 0, agent_id TEXT,
-  input_tokens INTEGER, output_tokens INTEGER);
+  input_tokens INTEGER, output_tokens INTEGER, cwd TEXT);
 CREATE TABLE IF NOT EXISTS tool_calls (
   id TEXT PRIMARY KEY, message_uuid TEXT, session_id TEXT,
   name TEXT, input_json TEXT, file_path TEXT);
@@ -44,6 +44,10 @@ CREATE TABLE IF NOT EXISTS summaries (
   source TEXT, content TEXT);
 CREATE TABLE IF NOT EXISTS meta (
   key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS memories (
+  id TEXT PRIMARY KEY, session_id TEXT, project TEXT,
+  message_start TEXT, message_end TEXT,
+  path TEXT, summary TEXT, created_at TEXT);
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
   uuid UNINDEXED, session_id UNINDEXED, text, content=messages, content_rowid=rowid);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
@@ -55,7 +59,15 @@ CREATE INDEX IF NOT EXISTS idx_sa_session ON subagents(session_id);
 CREATE INDEX IF NOT EXISTS idx_wf_session ON workflows(session_id);
 CREATE INDEX IF NOT EXISTS idx_wa_run ON workflow_agents(run_id);
 CREATE INDEX IF NOT EXISTS idx_summaries_session ON summaries(session_id);
+CREATE INDEX IF NOT EXISTS idx_memories_project ON memories(project);
+CREATE INDEX IF NOT EXISTS idx_memories_session ON memories(session_id);
+CREATE INDEX IF NOT EXISTS idx_memories_created ON memories(created_at);
 `;
+
+function ensureColumn(db, table, column, definition) {
+  const columns = db.prepare(`PRAGMA table_info(${table})`).all().map((row) => row.name);
+  if (!columns.includes(column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+}
 
 function openDb() {
   fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
@@ -64,6 +76,7 @@ function openDb() {
   db.exec('PRAGMA journal_mode=WAL');
   db.exec('PRAGMA synchronous=NORMAL');
   db.exec(SCHEMA);
+  ensureColumn(db, 'messages', 'cwd', 'TEXT');
   return db;
 }
 

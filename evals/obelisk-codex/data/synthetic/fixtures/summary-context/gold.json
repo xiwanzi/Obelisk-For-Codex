@@ -1,0 +1,10 @@
+{
+  "expected_facts": [
+    "schema-safe SQL 必须使用占位符和 LIMIT",
+    "summary 只是入口"
+  ],
+  "expected_evidence": [
+    { "type": "summary", "id": "summary-context-session:compact:3", "required": true },
+    { "type": "message", "id": "summary-context-session:4", "required": true }
+  ]
+}

@@ -1,0 +1,9 @@
+{
+  "expected_facts": [
+    "Parser agent 结论是保留 raw JSONL relationships"
+  ],
+  "expected_evidence": [
+    { "type": "workflow", "id": "codex:spawned-agents-workflow-session", "required": true },
+    { "type": "subagent", "id": "agent_parser_1", "required": true }
+  ]
+}

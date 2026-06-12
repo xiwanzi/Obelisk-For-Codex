@@ -1,2 +1,5 @@
 .DS_Store
 plans/
+_obelisk_iterations/
+evals/obelisk-codex/.tmp/
+evals/obelisk-codex/reports/

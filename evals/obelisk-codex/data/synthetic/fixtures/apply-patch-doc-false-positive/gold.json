@@ -1,0 +1,9 @@
+{
+  "expected_facts": [
+    "C:\\Fixture\\Obelisk\\src\\actual.ts",
+    "docs/fake-mentioned.md 没有被当作 edit"
+  ],
+  "expected_evidence": [
+    { "type": "tool_call", "id": "call_apply_patch", "required": true }
+  ]
+}

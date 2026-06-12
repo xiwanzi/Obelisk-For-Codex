@@ -18,9 +18,9 @@ triggers:
 
 # obelisk-codex
 
-Query Codex's local session history. This skill indexes JSONL session logs under `~/.codex/sessions/` and `~/.codex/archived_sessions/`, then exposes them through a small SQLite-backed query API.
+Query Codex's local session history. This skill indexes JSONL session logs under `~/.codex/sessions/` and `~/.codex/archived_sessions/`, then exposes SQLite + FTS5 through a small JavaScript query API.
 
-Use it when the user asks about prior Codex work, wants to continue a past thread, asks how a bug was fixed before, or explicitly writes `/obelisk-codex ...`.
+Obelisk-Codex is a CodeAct memory layer: write a bounded JS query, run it locally, read JSON, and answer with concise evidence. Do not browse or dump entire sessions by default.
 
 ## Quick Start
 
@@ -38,142 +38,164 @@ node "$env:SKILL_DIR\scripts\runtime.mjs" --search "keyword"
 
 Custom query:
 
-1. Write a JS query snippet to a temp file, for example `$env:TEMP\obelisk-codex-query.mjs`.
-2. Run: `node "$env:SKILL_DIR\scripts\runtime.mjs" --query "$env:TEMP\obelisk-codex-query.mjs"`.
-3. Parse the JSON stdout and answer the user directly.
+1. Write a bounded JS query snippet to a temp file.
+2. Run `node "$env:SKILL_DIR\scripts\runtime.mjs" --query "$env:TEMP\obelisk-codex-query.mjs"`.
+3. Parse JSON stdout and answer the user directly.
 
-The query file body is executed inside `(async () => { ... })()` with the API below available as globals. Use `return` to emit JSON-serializable results.
+Query scripts run inside `(async () => { ... })()`. Use `return` to emit JSON. Query scripts are read-only: `remember()` is not available, and `sql()` only accepts read-only `SELECT` / `WITH` queries.
 
-## API
+## Default First Pass
 
-### search(text, opts?)
+Start with helpers, not raw SQL. For a new retrieval task, normally call `overview({ limit: 6 })` unless the user already gave an exact `session_id`, message `uuid`, or absolute file path.
+
+For semantic or synthesis tasks, combine orientation, memory recall, and raw session evidence:
+
+```js
+const map = overview({ limit: 6 });
+const project = map.current.project?.project;
+const topic = 'English topic terms translated from the user request';
+
+return {
+  orientation: map.current_project,
+  prior_memories: memories({ project, query: topic, limit: 5 }),
+  session_evidence: search(topic.replace(/[-_]/g, ' '), { project, limit: 8 }),
+};
+```
+
+Use `sql()` only for exact joins, aggregations, or schema questions helpers cannot express cleanly.
+
+## Query Routing
+
+- Read `references/query-patterns.md` before broad synthesis, progress summaries, design history, or questions about what was decided, tried, abandoned, or learned.
+- Read `references/retrieval-semantics.md` before multi-step retrieval, scoped project/file/session searches, or conclusion/history questions.
+- Read `references/schema.md` before raw `sql()` unless the needed table/column relationship is already explicit here.
+- Read `references/pitfalls.md` after query errors, empty results, unclear helper fields, FTS syntax problems, or over-large output.
+
+When a helper row shape is unclear, run a tiny scoped sample and return `Object.keys(row)` or a compact row. Do not invent field names.
+
+## Core API
+
+### `search(text, opts?)`
 
 Full-text search across indexed Codex user messages, assistant messages, reasoning summaries, tool calls, and tool outputs.
 
-Returns: `[{ message: {uuid, text, role, timestamp, model}, session: {id, title, project, started_at}, context: [...] }]`
-
-Options: `{ limit, sessionId, project, after, before }`
-
-### sessions(opts?)
-
-Query Codex sessions ordered by most recent end time.
-
-Options: `{ project, after, before, limit, branch, sessionId, sessions }`
+Returns:
 
 ```js
-sessions({ project: '%wiki维护%', limit: 10 })
-sessions({ after: '2026-06-01', limit: 5 })
+[{ message: { uuid, text, role, timestamp, model, cwd },
+   session: { id, title, project, started_at },
+   rank,
+   context }]
 ```
 
-### recent(n?)
+Opts: `{ limit, sessionId, project, after, before, cwd }`. `project` and `cwd` are SQL `LIKE` filters. Results are ordered by FTS5 rank; lower rank sorts earlier.
 
-Latest `n` Codex sessions, default `10`.
+`search()` passes `text` directly to SQLite FTS5. For punctuation-heavy literals such as Windows paths, pass a valid FTS phrase yourself or use scoped SQL `LIKE`.
 
-### context(uuid)
+### `context(uuid)`
 
-Details for a message plus its session and nearby messages. Codex logs do not expose Claude-style parent UUID chains, so `parentChain` is usually empty and `neighbors` provides the useful local context.
+Returns `{ message, parentChain, neighbors, session, subagent, workflow }`. Codex logs usually do not expose Claude-style parent chains, so `neighbors` is the useful local context source.
 
-### sql(query, ...params)
+### `sql(query, ...params)`
 
-Raw SQLite query. Use `?` placeholders.
+Read-only SQL with `?` placeholders. Only `SELECT` and `WITH` are allowed. Mutating/admin SQL such as `INSERT`, `DELETE`, `PRAGMA`, `VACUUM`, and `ATTACH` is rejected.
 
-Read `references/schema.md` before writing non-trivial SQL. Tables include `sessions`, `messages`, `tool_calls`, `tool_results`, `summaries`, `subagents`, and `workflows`.
+Before non-trivial SQL, read `references/schema.md`.
 
-### Other APIs
+## Structured Helpers
 
-- `thread(sessionId)` -- all indexed records in a Codex session, ordered by time
-- `fileHistory(filePath, opts?)` -- recent tool calls that mention a file path. Use `{ mode: 'write' }` for high-confidence edits only.
-- `fileSessions(filePath, opts?)` -- sessions where a file was touched, grouped by session with touch counts and matching tool calls. Use `{ mode: 'write' }` for edits only.
-- `fileEdits(filePath, opts?)` -- shortcut for `fileSessions(filePath, { mode: 'write', ...opts })`
-- `repeatedFiles(opts?)` -- files edited across multiple sessions by default. Use `{ mode: 'touch' }` to include read/search mentions. opts: `{ minSessions, mode, project, after, before, limit }`
-- `failures(opts?)` -- tool outputs inferred as errors, with nearby messages
-- `summaries(opts?)` -- compacted context and task-completion summaries
-- `raw(uuid, opts?)` -- original JSONL line window for an indexed message
-- `subagents(opts?)` -- Codex spawned agent metadata plus latest conclusion
-- `workflows(opts?)` -- Codex sessions that used spawned agents, exposed as workflow-like runs
-- `workflowTree(runId)` -- workflow plus spawned agents, their messages, and their recorded conclusions
-- `trace(uuid)` -- compatibility API; Codex logs usually do not expose parent chains
+All list helpers accept bounded `limit`. Many also accept `{ project, after, before, sessionId, sessions, branch }`.
 
-## Retrieval Strategy
+- `overview(opts?)` -- compact orientation map: current cwd/project when knowable, global project counts, recent current-project sessions, and memory records.
+- `sessions(opts?)` / `recent(n?)` -- session rows, newest first.
+- `summaries(opts?)` -- compaction and task-completion summaries.
+- `fileHistory(filePath, opts?)` -- tool calls mentioning a file; includes read/search mentions by default.
+- `fileSessions(filePath, opts?)` -- sessions where a file was touched, grouped by session.
+- `fileEdits(filePath, opts?)` -- high-confidence writes only.
+- `repeatedFiles(opts?)` -- files edited across multiple sessions by default; pass `{ mode: 'touch' }` to include reads/searches.
+- `failures(opts?)` -- failed tool results with nearby messages.
+- `subagents(opts?)`, `workflows(opts?)`, `workflowTree(runId)` -- Codex spawned-agent workflow-like reconstruction.
+- `thread(sessionId)` -- full session messages; last resort only.
+- `raw(uuid, opts?)` -- windowed access to the original JSONL line.
+- `memories(opts?)` -- recall registered memory records, newest first.
 
-Prefer incremental retrieval:
+## Memory Layer
 
-1. `recent()` or `sessions({ project: '...' })` to find candidate sessions.
-2. `summaries({ sessions: [...] })` to cheaply inspect likely sessions.
-3. `search('specific terms')` to find exact messages or tool calls.
-4. `context(uuid)` for nearby messages.
-5. `raw(uuid)` only when indexed text was truncated or the exact JSONL record matters.
-6. `thread(sessionId)` only as a last resort.
+Obelisk-Codex has persistent markdown memories alongside raw session data. Query both layers: use `memories()` for prior conclusions and `search()` / helpers for raw evidence. Treat memory as prior notes, not final authority.
 
-Never dump entire sessions unless the user explicitly needs it.
+The memory layer is English-indexed. Use English terms in `memories({ query })` even when the user asks in another language. Write every `remember().summary` in English. The runtime rejects obvious CJK text in memory queries and summaries.
 
-## Examples
-
-### "上次怎么修 wiki 同步的"
+Recall:
 
 ```js
-const hits = search('wiki 同步 修', { limit: 8 })
-return hits.map(h => ({
-  session: h.session.title,
-  date: h.session.started_at,
-  role: h.message.role,
-  text: h.message.text?.slice(0, 240)
-}))
+return memories({
+  query: 'persistent Codex memory layer',
+  project: '%Obelisk%',
+  limit: 5,
+});
 ```
 
-### "最近在做什么"
+Writing memories requires user approval. Flow:
+
+1. Write a markdown file, usually under `.obelisk/memories/` in the source project.
+2. Register it through the narrow runtime:
 
 ```js
-return recent(10).map(s => ({
-  title: s.title,
-  project: s.project,
-  started: s.started_at,
-  ended: s.ended_at
-}))
+return remember({
+  path: '.obelisk/memories/design-decision.md',
+  session_id: 'source-session-id',
+  message_start: 'first-message-uuid',
+  message_end: 'last-message-uuid',
+  summary: 'Decision: keep durable conclusions in project markdown and index English summaries for stable recall.'
+});
 ```
 
-### "最近哪些工具失败了"
+Run:
+
+```powershell
+node "$env:SKILL_DIR\scripts\runtime.mjs" --remember "$env:TEMP\register-memory.mjs"
+```
+
+`--remember` exposes only `remember()`. It does not expose `search()`, `sql()`, `memories()`, or other query helpers. Relative paths resolve against the source session's `project_path` when `session_id` is provided, otherwise against the runtime cwd. `remember()` validates that the markdown file already exists.
+
+Good memory candidates: design decisions, project conventions, abandoned alternatives, repeated failure causes, workflow patterns, and conclusions synthesized across multiple evidence points. Do not propose memory for one-off lookups or uncertain findings.
+
+## Minimal Patterns
+
+Find recent context:
+
+```js
+return overview({ limit: 6 });
+```
+
+Search, then expand one promising hit:
+
+```js
+const hits = search('auth fix', { limit: 5 });
+if (!hits.length) return [];
+return hits.slice(0, 3).map(h => ({
+  session_id: h.session.id,
+  session_title: h.session.title,
+  uuid: h.message.uuid,
+  snippet: h.message.text?.slice(0, 240),
+}));
+```
+
+File edit history:
+
+```js
+return fileEdits('C:\\Mod\\wiki维护\\sync_public_wiki.py', { limit: 20 });
+```
+
+Recent failures:
 
 ```js
 return failures({ limit: 20 }).map(f => ({
   tool: f.toolCall?.name,
   session: f.session?.title,
   timestamp: f.result?.timestamp,
-  output: f.result?.content?.slice(0, 300)
-}))
-```
-
-### "这个文件之前在哪些 session 里改过"
-
-```js
-return fileEdits('C:\\Mod\\wiki维护\\sync_public_wiki.py', { limit: 20 })
-```
-
-### "哪些文件最近在多个 sessions 里反复修改"
-
-```js
-return repeatedFiles({ minSessions: 3, limit: 20 }).map(f => ({
-  file: f.file_path,
-  sessions: f.sessions,
-  touches: f.touches,
-  last: f.last_touched
-}))
-```
-
-### "那个 review workflow 的 subagents 各自结论是什么"
-
-```js
-const reviewRuns = workflows({ limit: 20 })
-  .filter(w => /review|审查|复盘|QA/i.test(`${w.script || ''} ${w.result_json || ''}`))
-const run = reviewRuns[0] || workflows({ limit: 1 })[0]
-if (!run) return []
-const tree = workflowTree(run.run_id)
-return tree.agents.map(a => ({
-  agent: a.agent_id,
-  type: a.agent_type,
-  task: a.description,
-  conclusions: a.conclusions.map(c => c.text.slice(0, 500))
-}))
+  output: f.result?.content?.slice(0, 300),
+}));
 ```
 
 ## Notes
@@ -182,7 +204,4 @@ return tree.agents.map(a => ({
 - The index scans `~/.codex/sessions/**/*.jsonl` and `~/.codex/archived_sessions/*.jsonl`.
 - `session_index.jsonl` is used to recover Codex thread titles where available.
 - Codex `spawn_agent`, `wait_agent`, and `close_agent` tool calls are mapped into workflow-like `subagents()` / `workflowTree()` data.
-- File paths are normalized and common runtime/tool paths are filtered before repeated-file analysis.
-- Query snippets run in a sandboxed VM context without file system or network access.
-- Indexed text is truncated to 10k characters per record; use `raw()` to inspect original JSONL windows.
-- FTS5 search supports standard SQLite FTS syntax: `"exact phrase"`, `term1 AND term2`, `term1 OR term2`, `term1 NOT term2`.
+- Indexed text is truncated to 10k characters per record; use `raw()` for exact JSONL windows.

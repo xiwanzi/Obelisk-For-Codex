@@ -1,0 +1,8 @@
+{
+  "expected_facts": [
+    "C:\\Fixture\\Obelisk\\中文路径\\a:b\\file.ts"
+  ],
+  "expected_evidence": [
+    { "type": "message", "id": "fts-punctuation-path-session:3", "required": true }
+  ]
+}
